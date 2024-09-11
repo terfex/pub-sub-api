@@ -49,29 +49,32 @@ public class Subscribe extends CommonContext {
     private final ScheduledExecutorService retryScheduler;
     // Replay should be stored in replay store as bytes since replays are opaque.
     private volatile ByteString storedReplay;
+    private final boolean processChangedFields;
 
     public Subscribe(ExampleConfigurations exampleConfigurations) {
         super(exampleConfigurations);
         isActive.set(true);
         this.exampleConfigurations = exampleConfigurations;
-        this.BATCH_SIZE = Math.min(5, exampleConfigurations.getNumberOfEventsToSubscribeInEachFetchRequest());
+        this.BATCH_SIZE = exampleConfigurations.getNumberOfEventsToSubscribeInEachFetchRequest();
         this.responseStreamObserver = getDefaultResponseStreamObserver();
         this.setupTopicDetails(exampleConfigurations.getTopic(), false, false);
         this.replayPreset = exampleConfigurations.getReplayPreset();
         this.customReplayId = exampleConfigurations.getReplayId();
         this.retryScheduler = Executors.newScheduledThreadPool(1);
+        this.processChangedFields = exampleConfigurations.getProcessChangedFields();
     }
 
     public Subscribe(ExampleConfigurations exampleConfigurations, StreamObserver<FetchResponse> responseStreamObserver) {
         super(exampleConfigurations);
         isActive.set(true);
         this.exampleConfigurations = exampleConfigurations;
-        this.BATCH_SIZE = Math.min(5, exampleConfigurations.getNumberOfEventsToSubscribeInEachFetchRequest());
+        this.BATCH_SIZE = exampleConfigurations.getNumberOfEventsToSubscribeInEachFetchRequest();
         this.responseStreamObserver = responseStreamObserver;
         this.setupTopicDetails(exampleConfigurations.getTopic(), false, false);
         this.replayPreset = exampleConfigurations.getReplayPreset();
         this.customReplayId = exampleConfigurations.getReplayId();
         this.retryScheduler = Executors.newScheduledThreadPool(1);
+        this.processChangedFields = exampleConfigurations.getProcessChangedFields();
     }
 
     /**
@@ -184,28 +187,30 @@ public class Subscribe extends CommonContext {
 
                     ReplayPreset retryReplayPreset = ReplayPreset.LATEST;
                     ByteString retryReplayId = null;
-                    long retryDelay = 0;
+                    long retryDelay = getBackoffWaitTime();
 
                     // Retry strategies that can be implemented based on the error type.
-                    if (errorCode.contains(ERROR_REPLAY_ID_VALIDATION_FAILED) || errorCode.contains(ERROR_REPLAY_ID_INVALID)) {
-                        logger.info("Invalid or no replayId provided in FetchRequest for CUSTOM Replay. Trying again with EARLIEST Replay.");
-                        retryDelay = getBackoffWaitTime();
-                        retryReplayPreset = ReplayPreset.EARLIEST;
-                    } else if (errorCode.contains(ERROR_SERVICE_UNAVAILABLE)) {
-                        logger.info("Service currently unavailable. Trying again with LATEST Replay.");
-                        retryDelay = SERVICE_UNAVAILABLE_WAIT_BEFORE_RETRY_SECONDS * 1000;
-                    } else {
-                        retryDelay = getBackoffWaitTime();
-                        if (storedReplay != null) {
-                            logger.info("Retrying with Stored Replay.");
-                            retryReplayPreset = ReplayPreset.CUSTOM;
-                            retryReplayId = getStoredReplay();
+                    if(errorCode != null && !errorCode.isEmpty()) {
+                        if (errorCode.contains(ERROR_REPLAY_ID_VALIDATION_FAILED) || errorCode.contains(ERROR_REPLAY_ID_INVALID)) {
+                            logger.info("Invalid or no replayId provided in FetchRequest for CUSTOM Replay. Trying again with EARLIEST Replay.");
+                            retryReplayPreset = ReplayPreset.EARLIEST;
+                        } else if (errorCode.contains(ERROR_SERVICE_UNAVAILABLE)) {
+                            logger.info("Service currently unavailable. Trying again with LATEST Replay.");
+                            retryDelay = SERVICE_UNAVAILABLE_WAIT_BEFORE_RETRY_SECONDS * 1000;
                         } else {
-                            logger.info("Retrying with LATEST Replay.");;
-                        }
+                            if (storedReplay != null) {
+                                logger.info("Retrying with Stored Replay.");
+                                retryReplayPreset = ReplayPreset.CUSTOM;
+                                retryReplayId = getStoredReplay();
+                            } else {
+                                logger.info("Retrying with LATEST Replay.");
+                            }
 
+                        }
+                    } else {
+                        logger.info("Unknown error. Retrying with LATEST Replay.");
                     }
-                    logger.info("Retrying in " + retryDelay + "ms.");
+                    logger.info(String.format("Retrying in %s ms.", retryDelay));
                     retryScheduler.schedule(new RetryRequestSender(retryReplayPreset, retryReplayId), retryDelay, TimeUnit.MILLISECONDS);
                 }
             }
@@ -246,6 +251,11 @@ public class Subscribe extends CommonContext {
         this.storedReplay = ce.getReplayId();
         GenericRecord record = deserialize(writerSchema, ce.getEvent().getPayload());
         logger.info("Received event with payload: " + record.toString() + " with schema name: " + writerSchema.getName());
+        if (processChangedFields) {
+            // This example expands the changedFields bitmap field in ChangeEventHeader.
+            // To expand the other bitmap fields, i.e., diffFields and nulledFields, replicate or modify this code.
+            processAndPrintBitmapFields(writerSchema, record, "changedFields");
+        }
     }
 
     /**
